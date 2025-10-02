@@ -17,6 +17,7 @@ impl Session {
 		Ok(Session { model })
 	}
 
+
 	pub fn run(&self, inputs: HashMap<String, Tensor>) -> candle_core::Result<HashMap<String, Tensor>> {
 		candle_onnx::simple_eval(&self.model, inputs)
 	}

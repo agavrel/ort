@@ -223,6 +223,21 @@ impl Session {
 		}
 	}
 
+	#[cfg(target_arch = "wasm32")]
+	pub fn run<'s, 'i, 'v: 'i, const N: usize>(&'s mut self, input_values: impl Into<SessionInputs<'i, 'v, N>>) -> Result<SessionOutputs<'s>> {
+		match input_values.into() {
+			SessionInputs::ValueSlice(input_values) => {
+				self.run_inner(self.inputs.iter().map(|input| input.name.as_str()).collect(), input_values.iter().collect(), None)
+			}
+			SessionInputs::ValueArray(input_values) => {
+				self.run_inner(self.inputs.iter().map(|input| input.name.as_str()).collect(), input_values.iter().collect(), None)
+			}
+			SessionInputs::ValueMap(input_values) => {
+				self.run_inner(input_values.iter().map(|(k, _)| k.as_ref()).collect(), input_values.iter().map(|(_, v)| v).collect(), None)
+			}
+		}
+	}
+
 	/// Run input data through the ONNX graph, performing inference, with a [`RunOptions`] struct. The most common usage
 	/// of `RunOptions` is to allow the session run to be terminated from a different thread.
 	///
@@ -269,6 +284,74 @@ impl Session {
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]
+	fn run_inner<'i, 'r, 's: 'r, 'v: 'i>(
+		&'s self,
+		input_names: SmallVec<&str, { STACK_SESSION_INPUTS }>,
+		input_values: SmallVec<&'i SessionInputValue<'v>, { STACK_SESSION_INPUTS }>,
+		run_options: Option<&'r UntypedRunOptions>
+	) -> Result<SessionOutputs<'r>> {
+		if input_values.len() > input_names.len() {
+			// If we provide more inputs than the model expects with `ort::inputs![a, b, c]`, then we get an `input_names` shorter
+			// than `inputs`. ONNX Runtime will attempt to look up the name of all inputs before doing any checks, thus going out of
+			// bounds of `input_names` and triggering a segfault, so we check that condition here. This will never trip for
+			// `ValueMap` inputs since the number of names & values are always equal as its a vec of tuples.
+			return Err(Error::new_with_code(
+				ErrorCode::InvalidArgument,
+				format!("{} inputs were provided, but the model only accepts {}.", input_values.len(), input_names.len())
+			));
+		}
+
+		let (output_names, mut output_tensors) = match run_options {
+			Some(r) => r.outputs.resolve_outputs(&self.outputs),
+			None => (self.outputs.iter().map(|o| o.name.as_str()).collect(), iter::repeat_with(|| None).take(self.outputs.len()).collect())
+		};
+		let output_value_ptrs: SmallVec<*mut ort_sys::OrtValue, { STACK_SESSION_OUTPUTS }> = output_tensors
+			.iter_mut()
+			.map(|c| match c {
+				Some(v) => v.ptr_mut(),
+				None => ptr::null_mut()
+			})
+			.collect();
+		let input_value_ptrs: SmallVec<*const ort_sys::OrtValue, { STACK_SESSION_INPUTS }> = input_values.iter().map(|c| c.ptr()).collect();
+
+		let run_options_ptr = if let Some(run_options) = &run_options { run_options.ptr.as_ptr() } else { ptr::null() };
+
+		with_cstr_ptr_array(&input_names, &|input_name_ptrs| {
+			with_cstr_ptr_array(&output_names, &|output_name_ptrs| {
+				ortsys![
+					unsafe Run(
+						self.inner.session_ptr.as_ptr(),
+						run_options_ptr,
+						input_name_ptrs.as_ptr(),
+						input_value_ptrs.as_ptr(),
+						input_value_ptrs.len(),
+						output_name_ptrs.as_ptr(),
+						output_name_ptrs.len(),
+						output_value_ptrs.as_ptr().cast_mut()
+					)?
+				];
+				Ok(())
+			})
+		})?;
+
+		let outputs = output_tensors
+			.into_iter()
+			.enumerate()
+			.map(|(i, v)| match v {
+				Some(value) => value,
+				None => unsafe {
+					Value::from_ptr(
+						NonNull::new(output_value_ptrs[i]).expect("OrtValue ptr returned from session Run should not be null"),
+						Some(Arc::clone(&self.inner))
+					)
+				}
+			})
+			.collect();
+
+		Ok(SessionOutputs::new(output_names, outputs))
+	}
+
+	#[cfg(target_arch = "wasm32")]
 	fn run_inner<'i, 'r, 's: 'r, 'v: 'i>(
 		&'s self,
 		input_names: SmallVec<&str, { STACK_SESSION_INPUTS }>,
